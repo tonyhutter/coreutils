@@ -17,6 +17,9 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+source "$(dirname $0)/mv.shlib"
+mv_run_this_script_both_single_and_multithreaded_ || exit $?
+
 . "${srcdir=.}/tests/init.sh"; path_prepend_ ./src
 print_ver_ mv
 cleanup_() { rm -rf "$other_partition_tmpdir"; }

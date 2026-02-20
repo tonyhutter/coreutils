@@ -71,6 +71,7 @@ static struct option const long_options[] =
   {"exchange", no_argument, NULL, EXCHANGE_OPTION},
   {"force", no_argument, NULL, 'f'},
   {"interactive", no_argument, NULL, 'i'},
+  {"parallel", required_argument, NULL, 'j'},
   {"no-clobber", no_argument, NULL, 'n'},   /* Deprecated.  */
   {"no-copy", no_argument, NULL, NO_COPY_OPTION},
   {"no-target-directory", no_argument, NULL, 'T'},
@@ -130,6 +131,7 @@ cp_option_init (struct cp_options *x)
   x->unlink_dest_after_failed_open = false;
   x->hard_link = false;
   x->interactive = I_UNSPECIFIED;
+  x->threads = 0;
   x->move_mode = true;
   x->install_mode = false;
   x->one_file_system = false;
@@ -287,6 +289,10 @@ Rename SOURCE to DEST, or move SOURCE(s) to DIRECTORY.\n\
          prompt before overwrite\n\
 "));
       oputs (_("\
+  -j N, --parallel=N\n\
+         parallelize mv by spawning N additional threads\n\
+"));
+      oputs (_("\
   -n, --no-clobber\n\
          do not overwrite an existing file\n\
 "));
@@ -350,6 +356,7 @@ main (int argc, char **argv)
   char const *target_directory = NULL;
   bool no_target_directory = false;
   bool selinux_enabled = (0 < is_selinux_enabled ());
+  char const *threads_arg = NULL;
 
   initialize_main (&argc, &argv);
   set_program_name (argv[0]);
@@ -365,7 +372,7 @@ main (int argc, char **argv)
   priv_set_remove_linkdir ();
 
   int c;
-  while ((c = getopt_long (argc, argv, "bfint:uvS:TZ", long_options, NULL))
+  while ((c = getopt_long (argc, argv, "bfij:nt:uvS:TZ", long_options, NULL))
          != -1)
     {
       switch (c)
@@ -380,6 +387,9 @@ main (int argc, char **argv)
           break;
         case 'i':
           x.interactive = I_ASK_USER;
+          break;
+        case 'j':
+          threads_arg = optarg;
           break;
         case 'n':
           x.interactive = I_ALWAYS_SKIP;
@@ -435,6 +445,9 @@ main (int argc, char **argv)
           usage (EXIT_FAILURE);
         }
     }
+
+  if (!set_cp_options_threads (&x, threads_arg, "MV_NUM_THREADS"))
+    usage (EXIT_FAILURE);
 
   int n_files = argc - optind;
   char **file = argv + optind;

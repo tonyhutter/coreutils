@@ -27,6 +27,7 @@
 #include "fadvise.h"
 #include "full-write.h"
 #include "ioblksize.h"
+#include "copy.h"
 
 /* Result of infer_scantype when it returns LSEEK_SCANTYPE.  */
 struct scan_inference
@@ -68,7 +69,7 @@ create_hole (int fd, char const *name, off_t size)
 
   if (file_end < 0)
     {
-      error (0, errno, _("cannot lseek %s"), quoteaf (name));
+      threaded_error (0, errno, _("cannot lseek %s"), quoteaf (name));
       return -1;
     }
 
@@ -78,7 +79,7 @@ create_hole (int fd, char const *name, off_t size)
      then make this allocation permanent.  */
   if (punch_hole (fd, file_end - size, size) < 0)
     {
-      error (0, errno, _("error deallocating %s"), quoteaf (name));
+      threaded_error (0, errno, _("error deallocating %s"), quoteaf (name));
       return -1;
     }
 
@@ -174,7 +175,7 @@ sparse_copy (int src_fd, int dest_fd, char **abuf, idx_t buf_size,
               n_copied = 0;
             else
               {
-                error (0, errno, _("error copying %s to %s"),
+                threaded_error (0, errno, _("error copying %s to %s"),
                        quoteaf_n (0, src_name), quoteaf_n (1, dst_name));
                 return -1;
               }
@@ -200,7 +201,7 @@ sparse_copy (int src_fd, int dest_fd, char **abuf, idx_t buf_size,
         {
           if (errno == EINTR)
             continue;
-          error (0, errno, _("error reading %s"), quoteaf (src_name));
+          threaded_error (0, errno, _("error reading %s"), quoteaf (src_name));
           return -1;
         }
       if (n_read == 0)
@@ -244,8 +245,8 @@ sparse_copy (int src_fd, int dest_fd, char **abuf, idx_t buf_size,
                 {
                   if (full_write (dest_fd, pbuf, psize) != psize)
                     {
-                      error (0, errno, _("error writing %s"),
-                             quoteaf (dst_name));
+                      threaded_error (0, errno, _("error writing %s"),
+                                      quoteaf (dst_name));
                       return -1;
                     }
                   psize = !prev_hole && transition ? csize : 0;
@@ -255,7 +256,8 @@ sparse_copy (int src_fd, int dest_fd, char **abuf, idx_t buf_size,
             {
               if (ckd_add (&psize, psize, csize))
                 {
-                  error (0, 0, _("overflow reading %s"), quoteaf (src_name));
+                  threaded_error (0, 0, _("overflow reading %s"),
+                                  quoteaf (src_name));
                   return -1;
                 }
             }
@@ -406,7 +408,7 @@ lseek_copy (int src_fd, int dest_fd, char **abuf, idx_t buf_size,
                  current one, write zeros to the destination file.  */
               if (! write_zeros (dest_fd, ext_hole_size, abuf, buf_size))
                 {
-                  error (0, errno, _("%s: write failed"),
+                  threaded_error (0, errno, _("%s: write failed"),
                          quotef (dst_name));
                   return -1;
                 }
@@ -446,7 +448,7 @@ lseek_copy (int src_fd, int dest_fd, char **abuf, idx_t buf_size,
   return src_total_size - src_pos;
 
  cannot_lseek:
-  error (0, errno, _("cannot lseek %s"), quoteaf (src_name));
+  threaded_error (0, errno, _("cannot lseek %s"), quoteaf (src_name));
   return -1;
 }
 #endif
@@ -551,7 +553,7 @@ copy_file_data (int ifd, struct stat const *ist, off_t ipos, char const *iname,
   enum scantype scantype = infer_scantype (ifd, ist, ipos, &scan_inference);
   if (scantype == ERROR_SCANTYPE)
     {
-      error (0, errno, _("cannot lseek %s"), quoteaf (iname));
+      threaded_error (0, errno, _("cannot lseek %s"), quoteaf (iname));
       return -1;
     }
   bool make_holes
@@ -630,13 +632,14 @@ copy_file_data (int ifd, struct stat const *ist, off_t ipos, char const *iname,
           ? ftruncate (ofd, oend) < 0
           : !write_zeros (ofd, hole_size, &buf, buf_size))
         {
-          error (0, errno, _("failed to extend %s"), quoteaf (oname));
+          threaded_error (0, errno, _("failed to extend %s"), quoteaf (oname));
           result = -1;
         }
       else if (make_holes
                && punch_hole (ofd, oend - hole_size, hole_size) < 0)
         {
-          error (0, errno, _("error deallocating %s"), quoteaf (oname));
+          threaded_error (0, errno, _("error deallocating %s"),
+                          quoteaf (oname));
           result = -1;
         }
     }

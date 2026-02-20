@@ -30,6 +30,9 @@
 # directory, because it requires use of the --preserve=link option that
 # mv enables by default.
 
+source "$(dirname $0)/mv.shlib"
+mv_run_this_script_both_single_and_multithreaded_ || exit $?
+
 . "${srcdir=.}/tests/init.sh"; path_prepend_ ./src
 print_ver_ cp
 skip_if_root_

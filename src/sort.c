@@ -522,6 +522,10 @@ Other options:\n\
          If F is -, read names from standard input\n\
 "));
       oputs (_("\
+  -j N, --parallel=N\n\
+         change the number of sorts run concurrently to N\n\
+"));
+      oputs (_("\
   -k, --key=KEYDEF\n\
          sort via a key; KEYDEF gives location and type\n\
 "));
@@ -550,10 +554,6 @@ Other options:\n\
          use DIR for temporaries, not $TMPDIR or %s;\n\
          multiple options specify multiple directories\n\
 "), DEFAULT_TMPDIR);
-      oputs (_("\
-      --parallel=N\n\
-         change the number of sorts run concurrently to N\n\
-"));
       oputs (_("\
   -u, --unique\n\
          output only the first of lines with equal keys;\n\
@@ -603,10 +603,9 @@ enum
   NMERGE_OPTION,
   RANDOM_SOURCE_OPTION,
   SORT_OPTION,
-  PARALLEL_OPTION
 };
 
-static char const short_options[] = "-bcCdfghik:mMno:rRsS:t:T:uVy:z";
+static char const short_options[] = "-bcCdfghij:k:mMno:rRsS:t:T:uVy:z";
 
 static struct option const long_options[] =
 {
@@ -637,7 +636,7 @@ static struct option const long_options[] =
   {"temporary-directory", required_argument, NULL, 'T'},
   {"unique", no_argument, NULL, 'u'},
   {"zero-terminated", no_argument, NULL, 'z'},
-  {"parallel", required_argument, NULL, PARALLEL_OPTION},
+  {"parallel", required_argument, NULL, 'j'},
   {GETOPT_HELP_OPTION_DECL},
   {GETOPT_VERSION_OPTION_DECL},
   {NULL, 0, NULL, 0},
@@ -4756,7 +4755,7 @@ main (int argc, char **argv)
           add_temp_dir (optarg);
           break;
 
-        case PARALLEL_OPTION:
+        case 'j':
           nthreads = specify_nthreads (oi, c, optarg);
           break;
 
