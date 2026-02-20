@@ -1,0 +1,22 @@
+# Shared functions for the cp tests
+
+# We want to run all the 'cp' tests both with multithreading off and on.
+# Rather than making duplicate copies of each test (with MP off/on), we simply
+# call this function at the beginning of the script.  It causes the entire
+# script to be run with multi-threading on (via the CP_NUM_THREADS environment
+# variable) before returning to run normally with multi-threading off.
+cp_run_this_script_both_single_and_multithreaded_()
+{
+   local rc=0
+   local script="$0"
+
+   if [ -n "${CP_NUM_THREADS+x}" ] ; then
+     echo "Running test multi-threaded with $CP_NUM_THREADS additional threads"
+   else
+     CP_NUM_THREADS=$(nproc) sh $script
+     rc=$?
+     echo "Running test single threaded"
+     unset CP_NUM_THREADS
+   fi
+   return $rc
+}

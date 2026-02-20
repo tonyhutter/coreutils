@@ -122,6 +122,7 @@ static struct option const long_opts[] =
   {"dereference", no_argument, NULL, 'L'},
   {"force", no_argument, NULL, 'f'},
   {"interactive", no_argument, NULL, 'i'},
+  {"parallel", required_argument, NULL, 'j'},
   {"link", no_argument, NULL, 'l'},
   {"no-clobber", no_argument, NULL, 'n'},   /* Deprecated.  */
   {"no-dereference", no_argument, NULL, 'P'},
@@ -205,6 +206,10 @@ Copy SOURCE to DEST, or multiple SOURCE(s) to DIRECTORY.\n\
       oputs (_("\
   -i, --interactive\n\
          prompt before overwrite (overrides a previous -n option)\n\
+"));
+      oputs (_("\
+  -j N, --parallel N\n\
+         spawn N additional threads to parallelize the copy.\n\
 "));
       oputs (_("\
   -H\n\
@@ -341,6 +346,16 @@ supported, while --reflink=never ensures a standard copy is performed.\n\
 As a special case, cp makes a backup of SOURCE when the force and backup\n\
 options are given and SOURCE and DEST are the same name for an existing,\n\
 regular file.\n\
+"), stdout);
+      fputs (_("\
+\n\
+The -j|--parallel value is internally capped to the number of CPUs.\n\
+If the --debug, -i, or --interactive flags are passed, multithreading is\n\
+silently disabled.  Multithreading is only used when copying regular files in\n\
+a recursive directory copy.  In addition to the -j and --parallel flags,\n\
+users can also set the 'CP_NUM_THREADS' environment variable to the number of\n\
+threads to use.  The -j and --parallel flags always take precedent over\n\
+'CP_NUM_THREADS'.\n\
 "), stdout);
       emit_ancillary_info (PROGRAM_NAME);
     }
@@ -929,6 +944,7 @@ cp_option_init (struct cp_options *x)
 
   x->dest_info = NULL;
   x->src_info = NULL;
+  x->threads = 0;
 }
 
 /* Given a string, ARG, containing a comma-separated list of arguments
@@ -1036,6 +1052,7 @@ main (int argc, char **argv)
   char *target_directory = NULL;
   bool no_target_directory = false;
   char const *scontext = NULL;
+  char const *threads_arg = NULL;
 
   initialize_main (&argc, &argv);
   set_program_name (argv[0]);
@@ -1049,7 +1066,7 @@ main (int argc, char **argv)
   cp_option_init (&x);
 
   int c;
-  while ((c = getopt_long (argc, argv, "abdfHilLnprst:uvxPRS:TZ",
+  while ((c = getopt_long (argc, argv, "abdfHij:lLnprst:uvxPRS:TZ",
                            long_opts, NULL))
          != -1)
     {
@@ -1122,6 +1139,9 @@ main (int argc, char **argv)
           x.hard_link = true;
           break;
 
+        case 'j':
+          threads_arg = optarg;
+          break;
         case 'L':
           x.dereference = DEREF_ALWAYS;
           break;
@@ -1244,6 +1264,9 @@ main (int argc, char **argv)
           usage (EXIT_FAILURE);
         }
     }
+
+  if (!set_cp_options_threads (&x, threads_arg, "CP_NUM_THREADS"))
+    usage (EXIT_FAILURE);
 
   /* With --sparse=never, disable reflinking so we create a non sparse copy.
      This will also have the effect of disabling copy offload as that may

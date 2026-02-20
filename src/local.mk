@@ -343,6 +343,9 @@ src_who_LDADD += $(READUTMP_LIB)
 src_kill_LDADD += $(LIBTHREAD)
 
 # for pthread-cond, pthread-mutex, pthread-thread
+src_cp_LDADD += $(LIBPMULTITHREAD)
+src_mv_LDADD += $(LIBPMULTITHREAD)
+src_ginstall_LDADD += $(LIBPMULTITHREAD)
 src_sort_LDADD += $(LIBPMULTITHREAD)
 
 # for pthread_sigmask

@@ -45,4 +45,9 @@ sort --parallel=1 -u in > exp || fail=1
 sort --parallel=2 -u -S 10b < in > out || fail=1
 compare exp out || fail=1
 
+# Re-run with -j instead of --parallel to verify -j works
+sort -j 1 -u in > exp || fail=1
+sort -j 2 -u -S 10b < in > out || fail=1
+compare exp out || fail=1
+
 Exit $fail

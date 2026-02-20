@@ -20,6 +20,9 @@
 # define COPY_H
 
 # include "hash.h"
+#include <pthread.h>
+#include "xstrtol.h"
+#include "backupfile.h"
 
 struct selabel_handle;
 
@@ -287,6 +290,9 @@ struct cp_options
   /* Control creation of COW files.  */
   enum Reflink_type reflink_mode;
 
+  /* Number of additional threads to spawn off for multithreaded copy. */
+  int threads;
+
   /* This is a set of destination name/inode/dev triples.  Each such triple
      represents a file we have created corresponding to a source file name
      that was specified on the command line.  Use it to avoid clobbering
@@ -359,5 +365,41 @@ void cp_options_default (struct cp_options *) _GL_ATTRIBUTE_NONNULL ();
 bool chown_failure_ok (struct cp_options const *)
   _GL_ATTRIBUTE_NONNULL () _GL_ATTRIBUTE_PURE;
 mode_t cached_umask (void);
+
+bool set_cp_options_threads (struct cp_options *x, char const *arg,
+   char const *envar);
+
+extern pthread_mutex_t print_lock;
+extern pthread_rwlock_t record_file_lock;
+
+#define threaded_error(...) do { \
+    pthread_mutex_lock (&print_lock); \
+    error (__VA_ARGS__); \
+    pthread_mutex_unlock (&print_lock); \
+} while (0)
+
+#define threaded_printf(...) do { \
+    pthread_mutex_lock (&print_lock); \
+    printf (__VA_ARGS__); \
+    pthread_mutex_unlock (&print_lock); \
+} while (0)
+
+#define threaded_emit_verbose(...) do { \
+    pthread_mutex_lock (&print_lock); \
+    emit_verbose (__VA_ARGS__); \
+    pthread_mutex_unlock (&print_lock); \
+} while (0)
+
+#define threaded_record_file(...) do { \
+    pthread_rwlock_wrlock (&record_file_lock); \
+    record_file (__VA_ARGS__); \
+    pthread_rwlock_unlock (&record_file_lock); \
+} while (0)
+
+#define threaded_seen_file(...) do { \
+    pthread_rwlock_rdlock (&record_file_lock); \
+    seen_file (__VA_ARGS__); \
+    pthread_rwlock_unlock (&record_file_lock); \
+} while (0)
 
 #endif

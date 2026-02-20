@@ -21,6 +21,7 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <selinux/selinux.h>
+#include <pthread.h>
 
 #if HAVE_HURD_H
 # include <hurd.h>
@@ -45,6 +46,7 @@
 #include "hashcode-file.h"
 #include "ignore-value.h"
 #include "issymlinkat.h"
+#include "nproc.h"
 #include "quote.h"
 #include "renameatu.h"
 #include "root-uid.h"
@@ -55,6 +57,7 @@
 #include "utimecmp.h"
 #include "utimens.h"
 #include "write-any-file.h"
+#include "xstrtol.h"
 #include "areadlink.h"
 #include "yesno.h"
 #include "selinux.h"
@@ -121,7 +124,28 @@ static bool copy_internal (char const *src_name, char const *dst_name,
                            bool *first_dir_created_per_command_line_arg,
                            bool *copy_into_self,
                            bool *rename_succeeded);
+
 static bool owner_failure_ok (struct cp_options const *x);
+
+static void un_backup_func (struct cp_options *x, char *earlier_file,
+                            struct stat *src_sb, char *dst_backup,
+                            int dst_dirfd, char *drelname, char *dst_relname,
+                            char *dst_name);
+
+static bool copy_reg_and_post_copy (char *src_name, char *dst_name,
+                                    int dst_dirfd, char *dst_relname,
+                                    char *drelname, struct cp_options *x,
+                                    mode_t dst_mode,
+                                    mode_t omitted_permissions, bool new_dst,
+                                    struct stat *src_sb, char *earlier_file,
+                                    char *dst_backup, mode_t src_mode,
+                                    bool command_line_arg,
+                                    char *thread_selinux_ctx);
+
+static bool early_post_copy (bool new_dst, mode_t src_mode, char *dst_name,
+                             struct cp_options *x, bool command_line_arg,
+                             int dst_dirfd, char *drelname,
+                             char *dst_relname);
 
 /* Pointers to the file names:  they're used in the diagnostic that is issued
    when we detect the user is trying to copy a directory into itself.  */
@@ -130,6 +154,218 @@ static char const *top_level_dst_name;
 
 /* debug info about the last file copy.  */
 static struct copy_debug copy_debug;
+
+struct queue
+{
+  void **entries;
+  unsigned long count;
+  unsigned long capacity;
+  unsigned long inflight;
+  unsigned long back;
+  unsigned long front;
+  pthread_mutex_t mutex;
+  pthread_cond_t add;
+  pthread_cond_t remove;
+  pthread_cond_t remove_inflight;
+};
+
+/* This function waits until both the entries in the queue and all in-flight
+ entries are finished.  It assumes the queue lock is held. */
+static void
+queue_drain_nolock (struct queue *queue)
+{
+  /* The order of these checks is important, since we can call this
+     function when queue->entries == NULL just to wait for the
+     in-flight entries to finish. */
+  while (queue->entries && queue->count != 0)
+    {
+      pthread_cond_wait (&queue->remove, &queue->mutex);
+    }
+
+  while (queue->inflight != 0)
+    {
+      pthread_cond_wait (&queue->remove_inflight, &queue->mutex);
+    }
+
+  /* The queue is now drained */
+}
+
+static void
+queue_drain (struct queue *queue)
+{
+  pthread_mutex_lock (&queue->mutex);
+  queue_drain_nolock (queue);
+  pthread_mutex_unlock (&queue->mutex);
+}
+
+/* Drain and stop the queue */
+static void
+queue_stop (struct queue *queue)
+{
+  pthread_mutex_lock (&queue->mutex);
+  if (queue->entries == NULL)
+    {
+      pthread_mutex_unlock (&queue->mutex);
+      return;
+    }
+  else
+    {
+      queue_drain_nolock (queue);
+
+      /* When queue->entries == NULL, it's a sign to waiting threads that we
+         have shut down the queue. */
+      free (queue->entries);
+      queue->entries = NULL;
+
+      /* Tell anyone waiting in queue_pop() to wake up.  They should see that
+         queue->entires == NULL and take appropriate action. */
+      pthread_cond_broadcast (&queue->add);
+    }
+  pthread_mutex_unlock (&queue->mutex);
+
+}
+
+static void
+queue_destroy (struct queue *queue)
+{
+  queue_stop (queue);
+  pthread_cond_destroy (&queue->add);
+  pthread_cond_destroy (&queue->remove);
+  pthread_cond_destroy (&queue->remove_inflight);
+  pthread_mutex_destroy (&queue->mutex);
+}
+
+static void
+queue_init (struct queue *queue, ssize_t num_entries)
+{
+  queue->entries = ximalloc (sizeof (*queue->entries) * num_entries);
+  queue->inflight = 0;
+  queue->count = 0;
+  queue->capacity = num_entries;
+  queue->back = 0;
+  queue->front = 0;
+  pthread_mutex_init (&queue->mutex, NULL);
+  pthread_cond_init (&queue->add, NULL);
+  pthread_cond_init (&queue->remove, NULL);
+  pthread_cond_init (&queue->remove_inflight, NULL);
+}
+
+struct file_entry
+{
+  char *src_name;
+  char *dst_name;
+  int dst_dirfd;
+  char *dst_relname;
+  char *drelname;
+  char *earlier_file;
+  struct cp_options options;
+  mode_t dst_mode;
+  mode_t omitted_permissions;
+  bool new_dst;
+  struct stat src_sb;
+  struct file_entry *next;
+  char *dst_backup;
+  mode_t src_mode;
+  bool command_line_arg;
+  bool rc;
+  char *thread_selinux_ctx;
+};
+
+static struct file_queue
+{
+  struct queue queue;
+  pthread_attr_t attr;
+  int error;
+} file_queue;
+
+static pthread_t *copy_thread;
+static int copy_threads;        /* number of threads */
+
+/* Used for threaded_printf and others */
+pthread_mutex_t print_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_rwlock_t record_file_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+/* Returns true if data was added to queue.  Returns false if
+   queue was already destroyed. */
+static bool
+queue_push (struct queue *queue, void *data)
+{
+
+  pthread_mutex_lock (&queue->mutex);
+
+  /* The queue is full, wait for a removal */
+  while (queue->count == queue->capacity)
+    {
+      pthread_cond_wait (&queue->remove, &queue->mutex);
+      if (queue->entries == NULL)
+        return false;
+    }
+
+  queue->entries[queue->back] = data;
+  queue->count++;
+  queue->back++;
+  if (queue->back == queue->capacity)
+    queue->back = 0;
+
+  pthread_cond_signal (&queue->add);
+  pthread_mutex_unlock (&queue->mutex);
+
+  return true;
+}
+
+/* Only remove from the queue and do nothing else */
+static void *
+queue_remove_entry (struct queue *queue)
+{
+  void *data;
+  data = queue->entries[queue->front];
+
+  queue->front++;
+  if (queue->front == queue->capacity)
+    queue->front = 0;
+
+  queue->count--;
+  return data;
+}
+
+static void *
+queue_pop (struct queue *queue)
+{
+  void *data;
+  pthread_mutex_lock (&queue->mutex);
+
+  while (queue->entries && queue->count == 0)
+    {
+      pthread_cond_wait (&queue->add, &queue->mutex);
+      if (queue->entries == NULL)
+        {
+          pthread_mutex_unlock (&queue->mutex);
+          return NULL;
+        }
+    }
+
+  if (queue->entries == NULL)
+    {
+      pthread_mutex_unlock (&queue->mutex);
+      return NULL;
+    }
+
+  data = queue_remove_entry (queue);
+  queue->inflight++;
+
+  pthread_cond_signal (&queue->remove);
+  pthread_mutex_unlock (&queue->mutex);
+  return data;
+}
+
+static void
+queue_entry_finished (struct queue *queue)
+{
+  pthread_mutex_lock (&queue->mutex);
+  queue->inflight--;
+  pthread_cond_signal (&queue->remove_inflight);
+  pthread_mutex_unlock (&queue->mutex);
+}
 
 static char const *
 copy_debug_string (enum copy_debug_val debug_val)
@@ -170,10 +406,10 @@ static void
 emit_debug (const struct cp_options *x)
 {
   if (! x->hard_link && ! x->symbolic_link && x->data_copy_required)
-    printf ("copy offload: %s, reflink: %s, sparse detection: %s\n",
-            copy_debug_string (copy_debug.offload),
-            copy_debug_string (copy_debug.reflink),
-            copy_debug_sparse_string (copy_debug.sparse_detection));
+    threaded_printf ("copy offload: %s, reflink: %s, sparse detection: %s\n",
+                     copy_debug_string (copy_debug.offload),
+                     copy_debug_string (copy_debug.reflink),
+                     copy_debug_sparse_string (copy_debug.sparse_detection));
 }
 
 #ifndef DEV_FD_MIGHT_BE_CHR
@@ -574,7 +810,8 @@ set_author (MAYBE_UNUSED char const *dst_name, MAYBE_UNUSED int dest_desc,
 
 bool
 set_process_security_ctx (char const *src_name, char const *dst_name,
-                          mode_t mode, bool new_dst, const struct cp_options *x)
+                          mode_t mode, bool new_dst,
+                          const struct cp_options *x)
 {
   if (x->preserve_security_context)
     {
@@ -645,8 +882,11 @@ set_file_security_ctx (char const *dst_name,
   if (! restorecon (x->set_security_context, dst_name, recurse))
     {
       if (all_errors || (some_errors && !errno_unsupported (errno)))
-        error (0, errno, _("failed to set the security context of %s"),
-               quoteaf_n (0, dst_name));
+        {
+          threaded_error (0, errno,
+                          _("failed to set the security context of %s"),
+                          quoteaf_n (0, dst_name));
+        }
       return false;
     }
 
@@ -709,6 +949,20 @@ handle_clone_fail (int dst_dirfd, char const *dst_relname,
   return true;
 }
 
+/* This is the same as xcopy_acl(), but runs serially.  We have to do
+   this since threaded_xcopy_acl() can call error() to print an error message,
+   which can garble the text with our threaded_error() calls. */
+static int
+threaded_xcopy_acl (char const *src_name, int source_desc,
+                    char const *dst_name, int dest_desc, mode_t mode)
+{
+  int rc;
+  pthread_mutex_lock (&print_lock);
+  rc = xcopy_acl (src_name, source_desc, dst_name, dest_desc, mode);
+  pthread_mutex_unlock (&print_lock);
+  return rc;
+}
+
 /* Copy a regular file from SRC_NAME to DST_NAME aka DST_DIRFD+DST_RELNAME.
    If the source file contains holes, copies holes and blocks of zeros
    in the source file as holes in the destination file.
@@ -751,13 +1005,14 @@ copy_reg (char const *src_name, char const *dst_name,
                        | (x->dereference == DEREF_NEVER ? O_NOFOLLOW : 0)));
   if (source_desc < 0)
     {
-      error (0, errno, _("cannot open %s for reading"), quoteaf (src_name));
+      threaded_error (0, errno, _("cannot open %s for reading"),
+                      quoteaf (src_name));
       return false;
     }
 
   if (fstat (source_desc, &src_open_sb) != 0)
     {
-      error (0, errno, _("cannot fstat %s"), quoteaf (src_name));
+      threaded_error (0, errno, _("cannot fstat %s"), quoteaf (src_name));
       return_val = false;
       goto close_src_desc;
     }
@@ -766,7 +1021,7 @@ copy_reg (char const *src_name, char const *dst_name,
      saved ones obtained via a previous call to stat.  */
   if (! psame_inode (src_sb, &src_open_sb))
     {
-      error (0, 0,
+      threaded_error (0, 0,
              _("skipping file %s, as it was replaced while being copied"),
              quoteaf (src_name));
       return_val = false;
@@ -813,11 +1068,12 @@ copy_reg (char const *src_name, char const *dst_name,
           if (unlinkat (dst_dirfd, dst_relname, 0) == 0)
             {
               if (x->verbose)
-                printf (_("removed %s\n"), quoteaf (dst_name));
+                threaded_printf (_("removed %s\n"), quoteaf (dst_name));
             }
           else if (errno != ENOENT)
             {
-              error (0, errno, _("cannot remove %s"), quoteaf (dst_name));
+              threaded_error (0, errno, _("cannot remove %s"),
+                              quoteaf (dst_name));
               return_val = false;
               goto close_src_desc;
             }
@@ -831,8 +1087,9 @@ copy_reg (char const *src_name, char const *dst_name,
              an appropriate security context.  */
           if (x->set_security_context)
             {
-              if (! set_process_security_ctx (src_name, dst_name, dst_mode,
-                                              true, x))
+
+              if (!set_process_security_ctx (src_name, dst_name, dst_mode,
+                                             true, x))
                 {
                   return_val = false;
                   goto close_src_desc;
@@ -843,7 +1100,6 @@ copy_reg (char const *src_name, char const *dst_name,
           *new_dst = true;
         }
     }
-
   if (*new_dst)
     {
 #if HAVE_FCLONEFILEAT && !USE_XATTR
@@ -900,7 +1156,7 @@ copy_reg (char const *src_name, char const *dst_name,
                                      AT_SYMLINK_NOFOLLOW)
                           != 0)
                         {
-                          error (0, errno, _("updating times for %s"),
+                          threaded_error (0, errno, _("updating times for %s"),
                                  quoteaf (dst_name));
                           return_val = false;
                           goto close_src_desc;
@@ -975,8 +1231,9 @@ copy_reg (char const *src_name, char const *dst_name,
                 }
               else
                 {
-                  error (0, 0, _("not writing through dangling symlink %s"),
-                         quoteaf (dst_name));
+                  threaded_error (0, 0,
+                                  _("not writing through dangling symlink %s"),
+                                  quoteaf (dst_name));
                   return_val = false;
                   goto close_src_desc;
                 }
@@ -996,7 +1253,7 @@ copy_reg (char const *src_name, char const *dst_name,
 
   if (dest_desc < 0)
     {
-      error (0, dest_errno, _("cannot create regular file %s"),
+      threaded_error (0, dest_errno, _("cannot create regular file %s"),
              quoteaf (dst_name));
       return_val = false;
       goto close_src_desc;
@@ -1025,7 +1282,7 @@ copy_reg (char const *src_name, char const *dst_name,
     sb.st_mode = 0;
   else if (fstat (dest_desc, &sb) != 0)
     {
-      error (0, errno, _("cannot fstat %s"), quoteaf (dst_name));
+      threaded_error (0, errno, _("cannot fstat %s"), quoteaf (dst_name));
       return_val = false;
       goto close_src_and_dst_desc;
     }
@@ -1057,7 +1314,8 @@ copy_reg (char const *src_name, char const *dst_name,
 
       if (fdutimensat (dest_desc, dst_dirfd, dst_relname, timespec, 0) != 0)
         {
-          error (0, errno, _("preserving times for %s"), quoteaf (dst_name));
+          threaded_error (0, errno, _("preserving times for %s"),
+                          quoteaf (dst_name));
           if (x->require_preserve)
             {
               return_val = false;
@@ -1065,7 +1323,6 @@ copy_reg (char const *src_name, char const *dst_name,
             }
         }
     }
-
   /* Set ownership before xattrs as changing owners will
      clear capabilities.  */
   if (x->preserve_ownership && ! SAME_OWNER_AND_GROUP (*src_sb, sb))
@@ -1097,8 +1354,8 @@ set_dest_mode:
 #endif
   if (x->preserve_mode || x->move_mode)
     {
-      if (xcopy_acl (src_name, source_desc, dst_name, dest_desc, src_mode) != 0
-          && x->require_preserve)
+      if (threaded_xcopy_acl (src_name, source_desc, dst_name, dest_desc,
+                              src_mode) != 0 && x->require_preserve)
         return_val = false;
     }
   else if (x->set_mode)
@@ -1119,7 +1376,7 @@ set_dest_mode:
                                 dst_mode & ~ cached_umask ())
               != 0))
         {
-          error (0, errno, _("preserving permissions for %s"),
+          threaded_error (0, errno, _("preserving permissions for %s"),
                  quoteaf (dst_name));
           if (x->require_preserve)
             return_val = false;
@@ -1132,13 +1389,13 @@ set_dest_mode:
 close_src_and_dst_desc:
   if (close (dest_desc) < 0)
     {
-      error (0, errno, _("failed to close %s"), quoteaf (dst_name));
+      threaded_error (0, errno, _("failed to close %s"), quoteaf (dst_name));
       return_val = false;
     }
 close_src_desc:
   if (close (source_desc) < 0)
     {
-      error (0, errno, _("failed to close %s"), quoteaf (src_name));
+      threaded_error (0, errno, _("failed to close %s"), quoteaf (src_name));
       return_val = false;
     }
 
@@ -1147,6 +1404,201 @@ close_src_desc:
     emit_debug (x);
 
   return return_val;
+}
+
+static bool
+copy_reg_and_post_copy (char *src_name, char *dst_name,
+                        int dst_dirfd, char *dst_relname, char *drelname,
+                        struct cp_options *x,
+                        mode_t dst_mode, mode_t omitted_permissions,
+                        bool new_dst, struct stat *src_sb, char *earlier_file,
+                        char *dst_backup, mode_t src_mode,
+                        bool command_line_arg, char *thread_selinux_ctx)
+{
+  bool ok;
+
+  if (thread_selinux_ctx != NULL
+      && 0 < setfscreatecon_raw (thread_selinux_ctx))
+    return false;
+
+  ok = copy_reg (src_name, dst_name, dst_dirfd, dst_relname, x,
+                 dst_mode, omitted_permissions, &new_dst, src_sb);
+  if (!ok)
+    {
+      un_backup_func (x, earlier_file, src_sb, dst_backup, dst_dirfd,
+                      drelname, dst_relname, dst_name);
+      return false;
+    }
+  else
+    {
+      if (!early_post_copy (new_dst, src_mode, dst_name,
+                            x, command_line_arg, dst_dirfd, drelname,
+                            dst_relname))
+        {
+          un_backup_func (x, earlier_file, src_sb, dst_backup, dst_dirfd,
+                          drelname, dst_relname, dst_name);
+          return false;
+        }
+
+    }
+  return true;
+}
+
+static void
+entry_free (struct file_entry *entry)
+{
+  free (entry->src_name);
+  free (entry->dst_name);
+  free (entry->dst_relname);
+  free (entry->dst_backup);
+  free (entry->drelname);
+  free (entry->earlier_file);
+  free (entry->thread_selinux_ctx);
+  free (entry);
+}
+
+static void
+file_queue_add (char const *src_name, char const *dst_name,
+                int dst_dirfd, char const *dst_relname, char const *drelname,
+                const struct cp_options *options,
+                mode_t dst_mode, mode_t omitted_permissions, bool *new_dst,
+                struct stat *src_sb, char *earlier_file,
+                char *dst_backup, mode_t src_mode, bool command_line_arg,
+                char *thread_selinux_ctx)
+{
+  struct file_entry *entry;
+
+  entry = ximalloc (sizeof (*entry));
+  entry->src_name = strdup (src_name);
+  entry->dst_name = strdup (dst_name);
+  entry->dst_dirfd = dst_dirfd;
+  entry->dst_relname = strdup (dst_relname);
+  entry->drelname = strdup (drelname);
+  entry->earlier_file = earlier_file ? strdup (earlier_file) : NULL;
+  entry->options = *options;
+  entry->dst_mode = dst_mode;
+  entry->omitted_permissions = omitted_permissions;
+  entry->new_dst = *new_dst;
+  entry->src_sb = *src_sb;
+  entry->next = NULL;
+  entry->dst_backup = dst_backup ? strdup (dst_backup) : NULL;
+  entry->src_mode = src_mode;
+  entry->command_line_arg = command_line_arg;
+  entry->thread_selinux_ctx = thread_selinux_ctx ? strdup (thread_selinux_ctx)
+                                                 : NULL;
+
+  if (!queue_push (&file_queue.queue, entry))
+    entry_free (entry);
+}
+
+static void *
+copy_thread_func (void *ptr)
+{
+  struct file_entry *entry;
+  (void) ptr;
+  bool success;
+  struct queue *queue = &file_queue.queue;
+  bool was_failure = false;
+
+  while (1)
+    {
+      /* try to get a file from the queue to start copying */
+      entry = queue_pop (queue);
+      if (!entry)
+        {
+          /* queue has been shut down */
+          break;
+        }
+
+      /* do the actual copy */
+      success = copy_reg_and_post_copy (entry->src_name,
+                                        entry->dst_name,
+                                        entry->dst_dirfd,
+                                        entry->dst_relname,
+                                        entry->drelname,
+                                        &entry->options,
+                                        entry->dst_mode,
+                                        entry->omitted_permissions,
+                                        entry->new_dst,
+                                        &entry->src_sb,
+                                        entry->earlier_file,
+                                        entry->dst_backup,
+                                        entry->src_mode,
+                                        entry->command_line_arg,
+                                        entry->thread_selinux_ctx);
+
+      /* tell the queue we've finished copying the file */
+      queue_entry_finished (queue);
+      entry_free (entry);
+
+      if (!success)
+        {
+          was_failure = true;
+        }
+    }
+  return (was_failure ? (void *) 1 : NULL);
+}
+
+static bool
+copy_threads_init (int threads)
+{
+  int i;
+  int rc;
+
+  copy_threads = threads;
+
+  if (threads == 0)
+    return true;                /* nothing to do */
+
+  pthread_attr_init (&file_queue.attr);
+
+  /* The Linux default thread stack size is 8MB, which is way too big (and
+     causes link-heap.sh to fail).  Request at least 64K. */
+  rc = pthread_attr_setstacksize (&file_queue.attr,
+                                  MAX (PTHREAD_STACK_MIN, 65536));
+  if (rc != 0)
+    {
+      pthread_attr_destroy (&file_queue.attr);
+      error (0, errno, _("cannot set thread stack size"));
+      return (false);
+    }
+
+  file_queue.error = 0;
+  copy_thread = ximalloc (sizeof (*copy_thread) * threads);
+
+  /* Experimentation showed the sweet spot for queue size is 'threads * 2'.
+     Beyond that there's really no performance gain. */
+  queue_init (&file_queue.queue, threads * 2);
+
+  for (i = 0; i < threads; i++)
+    pthread_create (&copy_thread[i], &file_queue.attr, copy_thread_func,
+                    NULL);
+
+  return true;
+}
+
+/* Returns true on success, false on failure */
+static bool
+copy_threads_finish (void)
+{
+  int i;
+  void *ret = NULL;
+  bool was_success = true;
+  if (copy_threads == 0)
+    return true;
+
+  queue_stop (&file_queue.queue);
+
+  for (i = 0; i < copy_threads; i++)
+    if ((pthread_join (copy_thread[i], &ret) != 0) || (ret != NULL))
+      was_success = false;
+
+  pthread_attr_destroy (&file_queue.attr);
+
+  queue_destroy (&file_queue.queue);
+
+  free (copy_thread);
+  return was_success;
 }
 
 /* Return whether it's OK that two files are the "same" by some measure.
@@ -1549,7 +2001,11 @@ create_hard_link (char const *src_name, int src_dirfd, char const *src_relname,
                   char const *dst_name, int dst_dirfd, char const *dst_relname,
                   bool replace, bool verbose, bool dereference)
 {
-  int err = force_linkat (src_dirfd, src_relname, dst_dirfd, dst_relname,
+  int err;
+
+  queue_drain (&file_queue.queue);
+
+  err  = force_linkat (src_dirfd, src_relname, dst_dirfd, dst_relname,
                           dereference ? AT_SYMLINK_FOLLOW : 0,
                           replace, -1);
   if (0 < err)
@@ -1565,7 +2021,7 @@ create_hard_link (char const *src_name, int src_dirfd, char const *src_relname,
       return false;
     }
   if (err < 0 && verbose)
-    printf (_("removed %s\n"), quoteaf (dst_name));
+    threaded_printf (_("removed %s\n"), quoteaf (dst_name));
   return true;
 }
 
@@ -1602,6 +2058,72 @@ source_is_dst_backup (char const *srcbase, struct stat const *src_st,
   int dst_back_status = fstatat (dst_dirfd, dst_back, &dst_back_sb, 0);
   free (dst_back);
   return dst_back_status == 0 && psame_inode (src_st, &dst_back_sb);
+}
+
+static void
+un_backup_func (struct cp_options *x, char *earlier_file, struct stat *src_sb,
+               char *dst_backup, int dst_dirfd, char *drelname,
+               char *dst_relname, char *dst_name)
+{
+  if (x->preserve_security_context)
+    restore_default_fscreatecon_or_die ();
+
+  /* We have failed to create the destination file.
+     If we've just added a dev/ino entry via the remember_copied
+     call above (i.e., unless we've just failed to create a hard link),
+     remove the entry associating the source dev/ino with the
+     destination file name, so we don't try to 'preserve' a link
+     to a file we didn't create.  */
+  if (earlier_file == NULL)
+    forget_created (src_sb->st_ino, src_sb->st_dev);
+
+  if (dst_backup)
+    {
+      char const *dst_relbackup = &dst_backup[dst_relname - dst_name];
+      if (renameat (dst_dirfd, dst_relbackup, dst_dirfd, drelname) != 0)
+        threaded_error (0, errno, _("cannot un-backup %s"), quoteaf (dst_name));
+      else
+        {
+          if (x->verbose)
+            threaded_printf (_("%s -> %s (unbackup)\n"),
+                    quoteaf_n (0, dst_backup), quoteaf_n (1, dst_name));
+        }
+    }
+}
+
+/*
+ * This contains some post-copy checks.  It is common code used by both
+ * copy_internal() and the multithreaded copy_reg().
+ */
+static bool
+early_post_copy (bool new_dst, mode_t src_mode, char *dst_name,
+                 struct cp_options *x, bool command_line_arg, int dst_dirfd,
+                 char *drelname, char *dst_relname)
+{
+  /* With -Z or --preserve=context, set the context for existing files.
+     Note this is done already for copy_reg() for reasons described therein.  */
+  if (!new_dst && !x->copy_as_regular && !S_ISDIR (src_mode)
+      && (x->set_security_context || x->preserve_security_context))
+    {
+      if (! set_file_security_ctx (dst_name, false, x))
+        {
+
+           if (x->require_preserve_context)
+             return false;
+        }
+    }
+
+  if (command_line_arg && x->dest_info)
+    {
+      /* Now that the destination file is very likely to exist,
+         add its info to the set.  */
+
+      struct stat sb;
+      if (fstatat (dst_dirfd, drelname, &sb, AT_SYMLINK_NOFOLLOW) == 0)
+        record_file (x->dest_info, dst_relname, &sb);
+    }
+
+  return true;
 }
 
 /* Copy the file SRC_NAME to the file DST_NAME aka DST_DIRFD+DST_RELNAME.
@@ -1645,6 +2167,8 @@ copy_internal (char const *src_name, char const *dst_name,
   bool copied_as_regular = false;
   bool dest_is_symlink = false;
   bool have_dst_lstat = false;
+  bool file_queued = false;
+  char *thread_selinux_ctx;
 
   *copy_into_self = false;
 
@@ -1670,7 +2194,7 @@ copy_internal (char const *src_name, char const *dst_name,
         = x->dereference == DEREF_NEVER ? AT_SYMLINK_NOFOLLOW : 0;
       if (follow_fstatat (dirfd, relname, &src_sb, fstatat_flags) != 0)
         {
-          error (0, errno, _("cannot stat %s"), quoteaf (name));
+          threaded_error (0, errno, _("cannot stat %s"), quoteaf (name));
           return false;
         }
 
@@ -1678,7 +2202,7 @@ copy_internal (char const *src_name, char const *dst_name,
 
       if (S_ISDIR (src_mode) && !x->recursive)
         {
-          error (0, 0, ! x->install_mode /* cp */
+          threaded_error (0, 0, ! x->install_mode /* cp */
                  ? _("-r not specified; omitting directory %s")
                  : _("omitting directory %s"),
                  quoteaf (src_name));
@@ -1703,8 +2227,9 @@ copy_internal (char const *src_name, char const *dst_name,
            && x->backup_type == no_backups
            && seen_file (x->src_info, src_name, &src_sb))
         {
-          error (0, 0, _("warning: source file %s specified more than once"),
-                 quoteaf (src_name));
+          threaded_error (0, 0,
+                          _("warning: source file %s specified more than once"),
+                          quoteaf (src_name));
           return true;
         }
 
@@ -1762,7 +2287,8 @@ copy_internal (char const *src_name, char const *dst_name,
             }
           else
             {
-              error (0, errno, _("cannot stat %s"), quoteaf (dst_name));
+              threaded_error (0, errno, _("cannot stat %s"),
+                              quoteaf (dst_name));
               return false;
             }
         }
@@ -1777,7 +2303,7 @@ copy_internal (char const *src_name, char const *dst_name,
               && ! same_file_ok (src_name, &src_sb, dst_dirfd, drelname,
                                  &dst_sb, x, &return_now))
             {
-              error (0, 0, _("%s and %s are the same file"),
+              threaded_error (0, 0, _("%s and %s are the same file"),
                      quoteaf_n (0, src_name), quoteaf_n (1, dst_name));
               return false;
             }
@@ -1867,9 +2393,10 @@ skip:
           if (skipped)
             {
               if (x->update == UPDATE_NONE_FAIL)
-                error (0, 0, _("not replacing %s"), quoteaf (dst_name));
+                threaded_error (0, 0, _("not replacing %s"),
+                                quoteaf (dst_name));
               else if (x->debug)
-                printf (_("skipped %s\n"), quoteaf (dst_name));
+                threaded_printf (_("skipped %s\n"), quoteaf (dst_name));
 
               return_now = true;
             }
@@ -1882,7 +2409,7 @@ skip:
           if (!S_ISDIR (src_mode) != !S_ISDIR (dst_sb.st_mode)
               && x->backup_type == no_backups && !x->exchange)
             {
-              error (0, 0,
+              threaded_error (0, 0,
                      _(S_ISDIR (src_mode)
                        ? ("cannot overwrite non-directory %s "
                           "with directory %s")
@@ -1903,7 +2430,7 @@ skip:
               && x->backup_type != numbered_backups && !x->exchange
               && seen_file (x->dest_info, dst_relname, &dst_sb))
             {
-              error (0, 0,
+              threaded_error (0, 0,
                      _("will not overwrite just-created %s with %s"),
                      quoteaf_n (0, dst_name), quoteaf_n (1, src_name));
               return false;
@@ -1933,7 +2460,7 @@ skip:
                   fmt = (x->move_mode
                  ? _("backing up %s might destroy source;  %s not moved")
                  : _("backing up %s might destroy source;  %s not copied"));
-                  error (0, 0, fmt,
+                  threaded_error (0, 0, fmt,
                          quoteaf_n (0, dst_name),
                          quoteaf_n (1, src_name));
                   return false;
@@ -1958,7 +2485,8 @@ skip:
                 }
               else if (errno != ENOENT)
                 {
-                  error (0, errno, _("cannot backup %s"), quoteaf (dst_name));
+                  threaded_error (0, errno, _("cannot backup %s"),
+                                  quoteaf (dst_name));
                   return false;
                 }
               new_dst = true;
@@ -1975,12 +2503,13 @@ skip:
             {
               if (unlinkat (dst_dirfd, dst_relname, 0) != 0 && errno != ENOENT)
                 {
-                  error (0, errno, _("cannot remove %s"), quoteaf (dst_name));
+                  threaded_error (0, errno, _("cannot remove %s"),
+                                  quoteaf (dst_name));
                   return false;
                 }
               new_dst = true;
               if (x->verbose)
-                printf (_("removed %s\n"), quoteaf (dst_name));
+                threaded_printf (_("removed %s\n"), quoteaf (dst_name));
             }
         }
     }
@@ -2005,7 +2534,7 @@ skip:
           && S_ISLNK (dst_lstat_sb->st_mode)
           && seen_file (x->dest_info, dst_relname, dst_lstat_sb))
         {
-          error (0, 0,
+          threaded_error (0, 0,
                  _("will not copy %s through just-created symlink %s"),
                  quoteaf_n (0, src_name), quoteaf_n (1, dst_name));
           return false;
@@ -2017,7 +2546,7 @@ skip:
      sure we'll create a directory.  Also don't announce yet when moving
      so we can distinguish renames versus copies.  */
   if (x->verbose && !x->move_mode && !S_ISDIR (src_mode))
-    emit_verbose ("%s -> %s", src_name, dst_name, dst_backup);
+    threaded_emit_verbose ("%s -> %s", src_name, dst_name, dst_backup);
 
   /* Associate the destination file name with the source device and inode
      so that if we encounter a matching dev/ino pair in the source tree
@@ -2088,16 +2617,17 @@ skip:
              then warn about copying a directory into itself.  */
           if (same_nameat (AT_FDCWD, src_name, dst_dirfd, earlier_file))
             {
-              error (0, 0, _("cannot copy a directory, %s, into itself, %s"),
-                     quoteaf_n (0, top_level_src_name),
-                     quoteaf_n (1, top_level_dst_name));
+              threaded_error (0, 0,
+                              _("cannot copy a directory, %s, into itself, %s"),
+                              quoteaf_n (0, top_level_src_name),
+                              quoteaf_n (1, top_level_dst_name));
               *copy_into_self = true;
               goto un_backup;
             }
           else if (same_nameat (dst_dirfd, dst_relname,
                                 dst_dirfd, earlier_file))
             {
-              error (0, 0, _("warning: source directory %s "
+              threaded_error (0, 0, _("warning: source directory %s "
                              "specified more than once"),
                      quoteaf (top_level_src_name));
               /* In move mode, if a previous rename succeeded, then
@@ -2125,8 +2655,9 @@ skip:
             {
               char *earlier = subst_suffix (dst_name, dst_relname,
                                             earlier_file);
-              error (0, 0, _("will not create hard link %s to directory %s"),
-                     quoteaf_n (0, dst_name), quoteaf_n (1, earlier));
+              threaded_error (0, 0,
+                              _("will not create hard link %s to directory %s"),
+                              quoteaf_n (0, dst_name), quoteaf_n (1, earlier));
               free (earlier);
               goto un_backup;
             }
@@ -2153,7 +2684,7 @@ skip:
       if (rename_errno == 0)
         {
           if (x->verbose)
-            emit_verbose (x->exchange
+            threaded_emit_verbose (x->exchange
                           ? _("exchanged %s <-> %s")
                           : _("renamed %s -> %s"),
                           src_name, dst_name, dst_backup);
@@ -2161,6 +2692,7 @@ skip:
           if (x->set_security_context)
             {
               /* -Z failures are only warnings currently.  */
+
               (void) set_file_security_ctx (dst_name, true, x);
             }
 
@@ -2192,9 +2724,10 @@ skip:
           /* FIXME: this is a little fragile in that it relies on rename(2)
              failing with a specific errno value.  Expect problems on
              non-POSIX systems.  */
-          error (0, 0, _("cannot move %s to a subdirectory of itself, %s"),
-                 quoteaf_n (0, top_level_src_name),
-                 quoteaf_n (1, top_level_dst_name));
+          threaded_error (0, 0,
+                          _("cannot move %s to a subdirectory of itself, %s"),
+                          quoteaf_n (0, top_level_src_name),
+                          quoteaf_n (1, top_level_dst_name));
 
           /* Note that there is no need to call forget_created here,
              (compare with the other calls in this file) since the
@@ -2211,7 +2744,7 @@ skip:
          rename fails with a value of errno not handled here.
          If/as those are reported, add them to the condition below.
          If this happens to you, please do the following and send the output
-         to the bug-reporting address (e.g., in the output of cp --help):
+         to the bug-reporting address (e.g., i.n the output of cp --help):
            touch k; perl -e 'rename "k","/tmp/k" or print "$!(",$!+0,")\n"'
          where your current directory is on one partition and /tmp is the other.
          Also, please try to find the E* errno macro name corresponding to
@@ -2236,7 +2769,7 @@ skip:
              fail.  Etc.  */
           char const *quoted_dst_name = quoteaf_n (1, dst_name);
           if (x->exchange)
-            error (0, rename_errno, _("cannot exchange %s and %s"),
+            threaded_error (0, rename_errno, _("cannot exchange %s and %s"),
                    quoteaf_n (0, src_name), quoted_dst_name);
           else
             switch (rename_errno)
@@ -2249,12 +2782,12 @@ skip:
                 /* The destination must be the problem.  Don't mention
                    the source as that is more likely to confuse the user
                    than be helpful.  */
-                error (0, rename_errno, _("cannot overwrite %s"),
+                threaded_error (0, rename_errno, _("cannot overwrite %s"),
                        quoted_dst_name);
                 break;
 
               default:
-                error (0, rename_errno, _("cannot move %s to %s"),
+                threaded_error (0, rename_errno, _("cannot move %s to %s"),
                        quoteaf_n (0, src_name), quoted_dst_name);
                 break;
               }
@@ -2273,7 +2806,7 @@ skip:
            != 0)
           && errno != ENOENT)
         {
-          error (0, errno,
+          threaded_error (0, errno,
              _("inter-device move failed: %s to %s; unable to remove target"),
                  quoteaf_n (0, src_name), quoteaf_n (1, dst_name));
           forget_created (src_sb.st_ino, src_sb.st_dev);
@@ -2281,7 +2814,8 @@ skip:
         }
 
       if (x->verbose && !S_ISDIR (src_mode))
-        emit_verbose (_("copied %s -> %s"), src_name, dst_name, dst_backup);
+        threaded_emit_verbose (_("copied %s -> %s"), src_name, dst_name,
+                               dst_backup);
       new_dst = true;
     }
 
@@ -2296,14 +2830,27 @@ skip:
         : S_ISDIR (src_mode) ? S_IWGRP | S_IWOTH
         : 0));
 
+
   delayed_ok = true;
 
   /* If required, set the default security context for new files.
      Also for existing files this is used as a reference
      when copying the context with --preserve=context.
-     FIXME: Do we need to consider dst_mode_bits here?  */
+     FIXME: Do we need to consider dst_mode_bits here?
+
+     Note - this will set the security context for the current thread.  If
+     we're running multitheaded, we will need to set the context again on
+     the new thread.  So save the context here so we can pass it to the
+     new thread to set. */
   if (! set_process_security_ctx (src_name, dst_name, src_mode, new_dst, x))
     return false;
+
+  if (copy_threads > 0)
+    {
+      if (getfscreatecon_raw (&thread_selinux_ctx) != 0)
+          thread_selinux_ctx = NULL; /* failure */
+    } else
+        thread_selinux_ctx = NULL;
 
   if (S_ISDIR (src_mode))
     {
@@ -2316,7 +2863,7 @@ skip:
 
       if (is_ancestor (&src_sb, ancestors))
         {
-          error (0, 0, _("cannot copy cyclic symbolic link %s"),
+          threaded_error (0, 0, _("cannot copy cyclic symbolic link %s"),
                  quoteaf (src_name));
           goto un_backup;
         }
@@ -2337,7 +2884,7 @@ skip:
           mode_t mode = dst_mode_bits & ~omitted_permissions;
           if (mkdirat (dst_dirfd, drelname, mode) != 0)
             {
-              error (0, errno, _("cannot create directory %s"),
+              threaded_error (0, errno, _("cannot create directory %s"),
                      quoteaf (dst_name));
               goto un_backup;
             }
@@ -2348,7 +2895,8 @@ skip:
 
           if (fstatat (dst_dirfd, drelname, &dst_sb, AT_SYMLINK_NOFOLLOW) != 0)
             {
-              error (0, errno, _("cannot stat %s"), quoteaf (dst_name));
+              threaded_error (0, errno, _("cannot stat %s"),
+                              quoteaf (dst_name));
               goto un_backup;
             }
           else if ((dst_sb.st_mode & S_IRWXU) != S_IRWXU)
@@ -2360,7 +2908,7 @@ skip:
 
               if (lchmodat (dst_dirfd, drelname, dst_mode | S_IRWXU) != 0)
                 {
-                  error (0, errno, _("setting permissions for %s"),
+                  threaded_error (0, errno, _("setting permissions for %s"),
                          quoteaf (dst_name));
                   goto un_backup;
                 }
@@ -2379,7 +2927,8 @@ skip:
           if (x->verbose)
             {
               if (x->move_mode)
-                printf (_("created directory %s\n"), quoteaf (dst_name));
+                threaded_printf (_("created directory %s\n"),
+                                 quoteaf (dst_name));
               else
                 emit_verbose ("%s -> %s", src_name, dst_name, NULL);
             }
@@ -2392,11 +2941,13 @@ skip:
              descendants, so use it to set the context for existing dirs here.
              This will also give earlier indication of failure to set ctx.  */
           if (x->set_security_context || x->preserve_security_context)
-            if (! set_file_security_ctx (dst_name, false, x))
-              {
-                if (x->require_preserve_context)
-                  goto un_backup;
-              }
+            {
+              if (!set_file_security_ctx (dst_name, false, x))
+                {
+                  if (x->require_preserve_context)
+                    goto un_backup;
+                }
+            }
         }
 
       /* Decide whether to copy the contents of the directory.  */
@@ -2442,7 +2993,7 @@ skip:
 
           if (! in_current_dir)
             {
-              error (0, 0,
+              threaded_error (0, 0,
            _("%s: can make relative symbolic links only in current directory"),
                      quotef (dst_name));
               goto un_backup;
@@ -2453,7 +3004,7 @@ skip:
                                  x->unlink_dest_after_failed_open, -1);
       if (0 < err)
         {
-          error (0, err, _("cannot create symbolic link %s to %s"),
+          threaded_error (0, err, _("cannot create symbolic link %s to %s"),
                  quoteaf_n (0, dst_name), quoteaf_n (1, src_name));
           goto un_backup;
         }
@@ -2496,10 +3047,29 @@ skip:
          normally the same, and the exception (where x->set_mode) is
          used only by 'install', which POSIX does not specify and
          where DST_MODE_BITS is what's wanted.  */
-      if (! copy_reg (src_name, dst_name, dst_dirfd, dst_relname,
-                      x, dst_mode_bits & S_IRWXUGO,
-                      omitted_permissions, &new_dst, &src_sb))
-        goto un_backup;
+
+
+      if (copy_threads == 0 || !S_ISREG (src_mode))
+        {
+          if (!copy_reg (src_name, dst_name, dst_dirfd, dst_relname,
+                         x, dst_mode_bits & S_IRWXUGO,
+                         omitted_permissions, &new_dst, &src_sb))
+            goto un_backup;
+        }
+      else
+        {
+          /* We only do multithreaded copies on actual regular files.  If we
+           * tried to do a multithreaded copy of a non-regular file with
+           * x->copy_as_regular set, we can run into issues with fifos and
+           * possibly others.
+           */
+          file_queued = true;
+          file_queue_add (src_name, dst_name, dst_dirfd, dst_relname,
+                          drelname, x, dst_mode_bits & S_IRWXUGO,
+                          omitted_permissions, &new_dst, &src_sb,
+                          earlier_file, dst_backup, src_mode,
+                          command_line_arg, thread_selinux_ctx);
+        }
     }
   else if (S_ISFIFO (src_mode))
     {
@@ -2511,7 +3081,8 @@ skip:
       if (mknodat (dst_dirfd, dst_relname, mode, 0) != 0)
         if (mkfifoat (dst_dirfd, dst_relname, mode & ~S_IFIFO) != 0)
           {
-            error (0, errno, _("cannot create fifo %s"), quoteaf (dst_name));
+            threaded_error (0, errno, _("cannot create fifo %s"),
+                            quoteaf (dst_name));
             goto un_backup;
           }
     }
@@ -2520,7 +3091,7 @@ skip:
       mode_t mode = src_mode & ~omitted_permissions;
       if (mknodat (dst_dirfd, dst_relname, mode, src_sb.st_rdev) != 0)
         {
-          error (0, errno, _("cannot create special file %s"),
+          threaded_error (0, errno, _("cannot create special file %s"),
                  quoteaf (dst_name));
           goto un_backup;
         }
@@ -2531,7 +3102,7 @@ skip:
       dest_is_symlink = true;
       if (src_link_val == NULL)
         {
-          error (0, errno, _("cannot read symbolic link %s"),
+          threaded_error (0, errno, _("cannot read symbolic link %s"),
                  quoteaf (src_name));
           goto un_backup;
         }
@@ -2558,7 +3129,7 @@ skip:
       free (src_link_val);
       if (0 < symlink_err)
         {
-          error (0, symlink_err, _("cannot create symbolic link %s"),
+          threaded_error (0, symlink_err, _("cannot create symbolic link %s"),
                  quoteaf (dst_name));
           goto un_backup;
         }
@@ -2576,8 +3147,9 @@ skip:
                   != 0)
               && ! chown_failure_ok (x))
             {
-              error (0, errno, _("failed to preserve ownership for %s"),
-                     dst_name);
+              threaded_error (0, errno,
+                              _("failed to preserve ownership for %s"),
+                              dst_name);
               if (x->require_preserve)
                 goto un_backup;
             }
@@ -2592,29 +3164,21 @@ skip:
     }
   else
     {
-      error (0, 0, _("%s has unknown file type"), quoteaf (src_name));
+      threaded_error (0, 0, _("%s has unknown file type"), quoteaf (src_name));
       goto un_backup;
     }
 
-  /* With -Z or --preserve=context, set the context for existing files.
-     Note this is done already for copy_reg() for reasons described therein.  */
-  if (!new_dst && !x->copy_as_regular && !S_ISDIR (src_mode)
-      && (x->set_security_context || x->preserve_security_context))
-    {
-      if (! set_file_security_ctx (dst_name, false, x))
-        {
-           if (x->require_preserve_context)
-             goto un_backup;
-        }
-    }
+  /* Post copy */
 
-  if (command_line_arg && x->dest_info)
+  if (!file_queued)
     {
-      /* Now that the destination file is very likely to exist,
-         add its info to the set.  */
-      struct stat sb;
-      if (fstatat (dst_dirfd, drelname, &sb, AT_SYMLINK_NOFOLLOW) == 0)
-        record_file (x->dest_info, dst_relname, &sb);
+      if (!early_post_copy (new_dst, src_mode, (char *) dst_name,
+                            (struct cp_options *) x, command_line_arg,
+                            dst_dirfd, (char *) drelname,
+                            (char *) dst_relname))
+        {
+          goto un_backup;
+        }
     }
 
   /* If we've just created a hard-link due to cp's --link option,
@@ -2648,7 +3212,8 @@ skip:
       int utimensat_flags = dest_is_symlink ? AT_SYMLINK_NOFOLLOW : 0;
       if (utimensat (dst_dirfd, drelname, timespec, utimensat_flags) != 0)
         {
-          error (0, errno, _("preserving times for %s"), quoteaf (dst_name));
+          threaded_error (0, errno, _("preserving times for %s"),
+                          quoteaf (dst_name));
           if (x->require_preserve)
             return false;
         }
@@ -2658,6 +3223,15 @@ skip:
   if (!dest_is_symlink && x->preserve_ownership
       && (new_dst || !SAME_OWNER_AND_GROUP (src_sb, dst_sb)))
     {
+      /* We need to make sure all files within the directories are written
+         before we apply the final directory permissions (since they may be
+         read-only).  For example, we don't want to be writing files to
+         a directory, and halfway though writing the files set RO on
+         the directory, causing the 2nd half of files to not write out.
+
+         Drain the queue to ensure all the files are written out. */
+      queue_drain (&file_queue.queue);
+
       switch (set_owner (x, dst_name, dst_dirfd, drelname, -1,
                          &src_sb, new_dst, &dst_sb))
         {
@@ -2683,7 +3257,7 @@ skip:
 
   if (x->preserve_mode || x->move_mode)
     {
-      if (xcopy_acl (src_name, -1, dst_name, -1, src_mode) != 0
+      if (threaded_xcopy_acl (src_name, -1, dst_name, -1, src_mode) != 0
           && x->require_preserve)
         return false;
     }
@@ -2720,7 +3294,8 @@ skip:
                                        AT_SYMLINK_NOFOLLOW)
                               != 0))
                 {
-                  error (0, errno, _("cannot stat %s"), quoteaf (dst_name));
+                  threaded_error (0, errno, _("cannot stat %s"),
+                                  quoteaf (dst_name));
                   return false;
                 }
               dst_mode = dst_sb.st_mode;
@@ -2731,10 +3306,28 @@ skip:
 
       if (restore_dst_mode)
         {
+          /* Imagine you have a read-only directory called 'foo' with files
+             in it.
+
+             If you did the standard "create the destination dir, then copy
+             the files" process, it wouldn't work, because you would first
+             create a read-only destination 'foo' directory, which you couldn't
+             write the files into (since it's RO).
+
+             Instead, temporarily create the destination 'foo' directory as
+             writeable, copy the files, then set 'foo' back to read-only.  This
+             is what the 'restore_dst_mode' flag is for - a way to remind us
+             to set back the destination dir bits to what they should be after
+             we have copied the files.
+
+             We must make sure all the files in the directory are already
+             written out before setting the proper destination bits.  That's
+             why there's a queue_drain() here (for multithreaded copies). */
+          queue_drain (&file_queue.queue);
           if (lchmodat (dst_dirfd, drelname, dst_mode | omitted_permissions)
               != 0)
             {
-              error (0, errno, _("preserving permissions for %s"),
+              threaded_error (0, errno, _("preserving permissions for %s"),
                      quoteaf (dst_name));
               if (x->require_preserve)
                 return false;
@@ -2746,30 +3339,10 @@ skip:
 
 un_backup:
 
-  if (x->preserve_security_context)
-    restore_default_fscreatecon_or_die ();
+  un_backup_func ((struct cp_options *) x, earlier_file, &src_sb, dst_backup,
+                  dst_dirfd, (char *) drelname, (char *) dst_relname,
+                  (char *) dst_name);
 
-  /* We have failed to create the destination file.
-     If we've just added a dev/ino entry via the remember_copied
-     call above (i.e., unless we've just failed to create a hard link),
-     remove the entry associating the source dev/ino with the
-     destination file name, so we don't try to 'preserve' a link
-     to a file we didn't create.  */
-  if (earlier_file == NULL)
-    forget_created (src_sb.st_ino, src_sb.st_dev);
-
-  if (dst_backup)
-    {
-      char const *dst_relbackup = &dst_backup[dst_relname - dst_name];
-      if (renameat (dst_dirfd, dst_relbackup, dst_dirfd, drelname) != 0)
-        error (0, errno, _("cannot un-backup %s"), quoteaf (dst_name));
-      else
-        {
-          if (x->verbose)
-            printf (_("%s -> %s (unbackup)\n"),
-                    quoteaf_n (0, dst_backup), quoteaf_n (1, dst_name));
-        }
-    }
   return false;
 }
 
@@ -2802,6 +3375,10 @@ copy (char const *src_name, char const *dst_name,
       int nonexistent_dst, const struct cp_options *options,
       bool *copy_into_self, bool *rename_succeeded)
 {
+
+  if (!copy_threads_init (options->threads))
+    return false;
+
   valid_options (options);
 
   /* Record the file names: they're used in case of error, when copying
@@ -2815,11 +3392,19 @@ copy (char const *src_name, char const *dst_name,
   top_level_dst_name = dst_name;
 
   bool first_dir_created_per_command_line_arg = false;
-  return copy_internal (src_name, dst_name, dst_dirfd, dst_relname,
-                        nonexistent_dst, NULL, NULL,
-                        options, true,
-                        &first_dir_created_per_command_line_arg,
-                        copy_into_self, rename_succeeded);
+  bool rc;
+  rc = copy_internal (src_name, dst_name, dst_dirfd, dst_relname,
+                      nonexistent_dst, NULL, NULL,
+                      options, true,
+                      &first_dir_created_per_command_line_arg,
+                      copy_into_self, rename_succeeded);
+
+  queue_stop (&file_queue.queue);
+
+  if (!copy_threads_finish ())
+    rc = false;
+
+  return rc;
 }
 
 /* Set *X to the default options for a value of type struct cp_options.  */
@@ -2896,4 +3481,66 @@ cached_umask (void)
       umask (mask);
     }
   return mask;
+}
+
+/* This is a helper function to set x->threads from a string value or
+   environment variable.  If both 'arg' and 'envar' are set, then arg is used.
+   This is used by 'cp' and 'mv'.  We assume 'x' already has all its other flags
+   set, since we examine x->debug and x->interactive in this function.  If
+   either x->debug and x->interactive are set, then x->threads is automatically
+   set to 0.
+
+   If invalid values are passed, then warnings are printed and 'x->threads' is
+   set to 0.
+
+   Return true if we can proceed with the copy, false otherwise.  */
+extern bool
+set_cp_options_threads (struct cp_options *x, char const *arg,
+                        char const *envar)
+{
+  uintmax_t nthreads = 0;
+  enum strtol_error e;
+  char *enval;
+  bool rc = true;
+
+  /* If the user passed in a -j|--parallel value, use that first.  If they
+     didn't, check if the envar value is set and use that.  Otherwise do a
+     sequential copy. */
+  if (arg)
+    {
+      e = xstrtoumax (arg, NULL, 10, &nthreads, "");
+      if (e != LONGINT_OK)
+        {
+          error (0, errno, _("error: invalid -j|--parallel value %s"),
+                 quoteaf (arg));
+          nthreads = 0;
+          rc = false;
+        }
+    }
+  else if (envar && (enval = getenv (envar)))
+    {
+      e = xstrtoumax (enval, NULL, 10, &nthreads, "");
+      if (e != LONGINT_OK)
+        {
+          nthreads = 0;
+          /* We make this just a warning so as not to completely break
+           * the command if someone has a bad environment variable.
+           */
+          error (0, errno, _("warning: invalid %s value %s"),
+                 envar, quoteaf (enval));
+        }
+    }
+
+  /* Experimentation showed there's no performance gain from using more
+     threads than CPUs.  In fact the sweet spot may be less than the number
+     of CPUs.  Capping the thread count also protects against the user from
+     specifying unreasonably high values without having to hardcode a limit. */
+  if (nthreads > num_processors (NPROC_CURRENT))
+    nthreads = num_processors (NPROC_CURRENT);
+
+  if (x->debug || x->interactive)
+    nthreads = 0;
+
+  x->threads = nthreads;
+  return rc;
 }

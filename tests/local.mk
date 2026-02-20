@@ -548,6 +548,7 @@ all_tests =					\
   tests/cp/cp-deref.sh				\
   tests/cp/cp-i.sh				\
   tests/cp/cp-mv-backup.sh			\
+  tests/cp/cp-parallel.sh                       \
   tests/cp/cp-parents.sh			\
   tests/cp/debug.sh				\
   tests/cp/deref-slink.sh			\
@@ -769,6 +770,7 @@ all_tests =					\
   tests/mv/leak-fd.sh				\
   tests/mv/mv-exchange.sh			\
   tests/mv/mv-n.sh				\
+  tests/mv/mv-parallel.sh			\
   tests/mv/mv-special-1.sh			\
   tests/mv/no-copy.sh				\
   tests/mv/no-target-dir.sh			\

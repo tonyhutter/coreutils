@@ -18,6 +18,7 @@
    Rewritten to use lib/hash.c by Jim Meyering.  */
 
 #include <config.h>
+#include <pthread.h>
 
 #include <sys/types.h>
 #include "system.h"
@@ -43,6 +44,7 @@ struct Src_to_dest
 /* This table maps source dev/ino to destination file name.
    We use it to preserve hard links when copying.  */
 static Hash_table *src_to_dest;
+static pthread_rwlock_t src_to_dest_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 /* Initial size of the above hash table.  */
 #define INITIAL_TABLE_SIZE 103
@@ -87,8 +89,9 @@ forget_created (ino_t ino, dev_t dev)
   probe.st_ino = ino;
   probe.st_dev = dev;
   probe.name = NULL;
-
+  pthread_rwlock_wrlock (&src_to_dest_lock);
   ent = hash_remove (src_to_dest, &probe);
+  pthread_rwlock_unlock (&src_to_dest_lock);
   if (ent)
     src_to_dest_free (ent);
 }
@@ -103,7 +106,9 @@ src_to_dest_lookup (ino_t ino, dev_t dev)
   struct Src_to_dest const *e;
   ent.st_ino = ino;
   ent.st_dev = dev;
+  pthread_rwlock_rdlock (&src_to_dest_lock);
   e = hash_lookup (src_to_dest, &ent);
+  pthread_rwlock_unlock (&src_to_dest_lock);
   return e ? e->name : NULL;
 }
 
@@ -122,7 +127,9 @@ remember_copied (char const *name, ino_t ino, dev_t dev)
   ent->st_ino = ino;
   ent->st_dev = dev;
 
+  pthread_rwlock_wrlock (&src_to_dest_lock);
   ent_from_table = hash_insert (src_to_dest, ent);
+  pthread_rwlock_unlock (&src_to_dest_lock);
   if (ent_from_table == NULL)
     {
       /* Insertion failed due to lack of memory.  */

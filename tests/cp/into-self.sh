@@ -21,6 +21,9 @@
 # Now it gives this:
 #   cp: can't copy a directory 'dir' into itself 'dir/dir'
 
+source "$(dirname $0)/cp.shlib"
+cp_run_this_script_both_single_and_multithreaded_ || exit $?
+
 . "${srcdir=.}/tests/init.sh"; path_prepend_ ./src
 print_ver_ cp
 
